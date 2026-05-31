@@ -43,6 +43,9 @@ jobs:
           set -euxo pipefail
           mkdir -p dist
           find bin -name 'luci-app-notifip*.ipk' -exec cp {} dist/ \;
+          # Stable-name copy so "/releases/latest/download/luci-app-notifip_all.ipk" works
+          versioned=$(ls dist/luci-app-notifip_*_all.ipk | head -1)
+          cp "$versioned" dist/luci-app-notifip_all.ipk
           ls -la dist/
 
       - name: Upload artifact

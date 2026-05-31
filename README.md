@@ -28,14 +28,30 @@ The script:
 3. installs `msmtp`, `curl`, `jsonfilter`, `cron` via `opkg` if missing,
 4. reloads `rpcd` and enables the service.
 
-### Option B — `.ipk` package via the OpenWRT SDK
+### Option B — `.ipk` from GitHub Releases (recommended for updates)
+
+The CI publishes a noarch `.ipk` on every tag. From the router:
+
+```sh
+URL=https://github.com/Kitround/NotifIP/releases/latest/download/luci-app-notifip_all.ipk
+# Some firmwares (GL.iNet, custom forks) strip the "arch all" line from /etc/opkg.conf.
+# Add it back if missing, then install.
+grep -q "^arch all " /etc/opkg.conf || echo "arch all 100" >> /etc/opkg.conf
+opkg update
+curl -fL -o /tmp/notifip.ipk "$URL"
+opkg install /tmp/notifip.ipk
+rm /tmp/notifip.ipk
+```
+
+Future updates: same commands. `/etc/config/notifip` is declared as a conffile, so opkg preserves your SMTP and source settings across upgrades.
+
+### Option C — Build `.ipk` yourself via the OpenWrt SDK
 
 ```sh
 cp -r NotifIP <openwrt-sdk>/package/luci-app-notifip
 cd <openwrt-sdk>
 make package/luci-app-notifip/compile V=s
-# The .ipk lands in bin/packages/<arch>/base/
-opkg install luci-app-notifip_1.0.0-1_all.ipk
+opkg install bin/packages/*/notifip_feed/luci-app-notifip_*_all.ipk
 ```
 
 ## Configuration
