@@ -12,52 +12,38 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: openwrt/sdk:x86-64-23.05.5
-      options: --user root
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          path: src
 
-      - name: Stage package into SDK
+      - name: Restructure repo as an OpenWrt feed
         shell: bash
-        env:
-          WORKSPACE: ${{ github.workspace }}
         run: |
           set -euxo pipefail
-          cd /home/build/openwrt
-          mkdir -p package/luci-app-notifip
-          cp -r "$WORKSPACE/Makefile" "$WORKSPACE/files" package/luci-app-notifip/
+          mkdir -p luci-app-notifip
+          cp -r src/Makefile src/files luci-app-notifip/
+          rm -rf src
+          ls -R luci-app-notifip
 
-      - name: Update feeds
-        shell: bash
-        run: |
-          cd /home/build/openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: Configure
-        shell: bash
-        run: |
-          cd /home/build/openwrt
-          make defconfig
-
-      - name: Build package
-        shell: bash
-        run: |
-          cd /home/build/openwrt
-          make package/luci-app-notifip/compile V=s
+      - name: Build .ipk with OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: x86_64-23.05.5
+          FEEDNAME: notifip_feed
+          PACKAGES: luci-app-notifip
+          V: s
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
 
       - name: Collect .ipk
         shell: bash
-        env:
-          WORKSPACE: ${{ github.workspace }}
         run: |
           set -euxo pipefail
-          mkdir -p "$WORKSPACE/dist"
-          find /home/build/openwrt/bin -name 'luci-app-notifip*.ipk' -exec cp {} "$WORKSPACE/dist/" \;
-          ls -la "$WORKSPACE/dist"
+          mkdir -p dist
+          find bin -name 'luci-app-notifip*.ipk' -exec cp {} dist/ \;
+          ls -la dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
