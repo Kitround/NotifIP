@@ -1,0 +1,72 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+CRON_TAG="# notifip"
+SCRIPT=/usr/bin/notifip
+CRONFILE=/etc/crontabs/root
+
+. /lib/functions.sh
+
+apply_cron() {
+	local enabled interval
+	# Harden config file (contains SMTP password)
+	[ -f /etc/config/notifip ] && chmod 600 /etc/config/notifip 2>/dev/null
+	config_load notifip
+	config_get enabled  general enabled 0
+	config_get interval general interval 5
+
+	case "$interval" in
+		*[!0-9]*|"") interval=5 ;;
+	esac
+	[ "$interval" -lt 1 ] && interval=1
+	[ "$interval" -gt 1440 ] && interval=1440
+
+	mkdir -p "$(dirname "$CRONFILE")"
+	touch "$CRONFILE"
+
+	sed -i "/$CRON_TAG/d" "$CRONFILE" 2>/dev/null
+
+	if [ "$enabled" = "1" ]; then
+		local cron_line
+		if [ "$interval" -lt 60 ]; then
+			cron_line="*/$interval * * * * $SCRIPT run $CRON_TAG"
+		elif [ "$interval" -eq 60 ]; then
+			cron_line="0 * * * * $SCRIPT run $CRON_TAG"
+		else
+			local h=$((interval / 60))
+			[ "$h" -gt 24 ] && h=24
+			cron_line="0 */$h * * * $SCRIPT run $CRON_TAG"
+		fi
+		echo "$cron_line" >> "$CRONFILE"
+	fi
+
+	if [ -x /etc/init.d/cron ]; then
+		/etc/init.d/cron enable 2>/dev/null
+		/etc/init.d/cron reload 2>/dev/null || /etc/init.d/cron restart 2>/dev/null
+	fi
+}
+
+remove_cron() {
+	sed -i "/$CRON_TAG/d" "$CRONFILE" 2>/dev/null
+	[ -x /etc/init.d/cron ] && /etc/init.d/cron reload 2>/dev/null
+}
+
+start_service() {
+	apply_cron
+	($SCRIPT run >/dev/null 2>&1) &
+}
+
+stop_service() {
+	remove_cron
+}
+
+reload_service() {
+	apply_cron
+}
+
+service_triggers() {
+	procd_add_reload_trigger "notifip"
+}

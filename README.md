@@ -1,0 +1,107 @@
+# NotifIP
+
+LuCI plugin for OpenWRT that sends an email (SMTP) when the WAN IP changes.
+
+- Choice between **public IP** (external HTTP services with fallback + double-check) or **local interface IP(s)**.
+- Triggered by cron (configurable interval, default 5 min) **and** by hotplug `ifup` on WAN.
+- Liveness mail on the first check after each reboot.
+- No anti-flap: one real change = one mail.
+- History viewable from LuCI.
+- SMTP password stored in `/etc/config/notifip` (root-readable only).
+
+## Install
+
+### Option A — `install.sh` script (recommended, no SDK)
+
+From this folder:
+
+```sh
+./install.sh root@192.168.1.1
+# or with a custom ssh port:
+./install.sh root@192.168.1.1 -p 2222
+```
+
+The script:
+
+1. copies the `files/` tree to `/` on the router,
+2. sets executable bits,
+3. installs `msmtp`, `curl`, `jsonfilter`, `cron` via `opkg` if missing,
+4. reloads `rpcd` and enables the service.
+
+### Option B — `.ipk` package via the OpenWRT SDK
+
+```sh
+cp -r NotifIP <openwrt-sdk>/package/luci-app-notifip
+cd <openwrt-sdk>
+make package/luci-app-notifip/compile V=s
+# The .ipk lands in bin/packages/<arch>/base/
+opkg install luci-app-notifip_1.0.0-1_all.ipk
+```
+
+## Configuration
+
+In LuCI: **Services → NotifIP**.
+
+- **Settings tab**: enable, interval, mode (public / interface), full SMTP config, recipient, **Send test mail** button.
+- **Sources tab**: ordered list of URLs queried in "public IP" mode (defaults: `ipify`, `ifconfig.me`, `icanhazip`).
+- **History tab**: current IP, table of changes, "Clear history" button.
+
+Save & Apply **before** clicking "Send test mail" — the button uses the saved configuration.
+
+## Logs
+
+On the router:
+
+```sh
+logread -e notifip               # syslog messages (success/failures)
+cat /etc/notifip/changes.log     # TSV history of changes
+cat /tmp/msmtp.notifip.log       # last msmtp output (SMTP debug)
+```
+
+## Project structure
+
+```
+NotifIP/
+├── Makefile                                          # OpenWRT package
+├── install.sh                                        # scp-based manual installer
+├── uninstall.sh                                      # mirror uninstaller
+├── LICENSE                                           # MIT
+├── files/
+│   ├── etc/
+│   │   ├── config/notifip                            # UCI defaults
+│   │   ├── hotplug.d/iface/30-notifip                # WAN ifup trigger
+│   │   └── init.d/notifip                            # cron / service mgmt
+│   ├── usr/
+│   │   ├── bin/notifip                               # main shell worker
+│   │   ├── libexec/rpcd/luci.notifip                 # ubus backend for LuCI
+│   │   └── share/
+│   │       ├── luci/menu.d/luci-app-notifip.json     # LuCI menu entry
+│   │       └── rpcd/acl.d/luci-app-notifip.json      # rpcd ACL
+│   └── www/luci-static/resources/view/notifip/
+│       ├── settings.js                               # Settings tab
+│       ├── sources.js                                # Sources tab
+│       └── history.js                                # History tab
+└── README.md
+```
+
+## Uninstall
+
+Via opkg if installed as `.ipk`:
+
+```sh
+opkg remove luci-app-notifip
+```
+
+Otherwise (manual install):
+
+```sh
+./uninstall.sh root@192.168.1.1
+```
+
+## Troubleshooting
+
+- **"msmtp not installed"** in logread → rerun `install.sh` or `opkg install msmtp`.
+- **Test mail says Success but no email arrives** → check spam, then `/tmp/msmtp.notifip.log` (often a server rejection after OK auth).
+- **`tls_certcheck off`** is used by default to avoid CA store issues on minimal OpenWRT builds. If you install `ca-bundle` and want strict checking, edit `/usr/bin/notifip` (`tls_certcheck on`).
+- **Empty tab after install** → `/etc/init.d/rpcd reload` then hard-refresh the browser (Ctrl+F5).
+- **535 Authentication failed (OVH, Gmail, etc.)** → wrong password, or 2FA requires an app password, or SMTP auth disabled on the mailbox.

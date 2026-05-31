@@ -1,0 +1,384 @@
+#!/bin/sh
+# NotifIP — WAN IP change notifier
+# Subcommands:
+#   run        normal check cycle (default)
+#   test-mail  send a test email using current SMTP config
+#   status     print JSON status (current IP, last change, etc.)
+#   log        print JSON log of changes
+#   clear-log  truncate the change log
+
+. /lib/functions.sh
+
+STATE_DIR=/etc/notifip
+STATE_FILE="$STATE_DIR/state"
+LOG_FILE="$STATE_DIR/changes.log"
+MSMTPRC=/etc/msmtprc.notifip
+BOOT_MARKER=/tmp/notifip.booted
+LOCK=/var/lock/notifip.lock
+LOG_MAX_LINES=500
+
+HOSTNAME=$(uci -q get system.@system[0].hostname 2>/dev/null)
+[ -n "$HOSTNAME" ] || HOSTNAME=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+[ -n "$HOSTNAME" ] || HOSTNAME=router
+# Strip CR/LF to prevent mail header injection through hostname
+HOSTNAME=$(printf '%s' "$HOSTNAME" | tr -d '\r\n')
+
+mkdir -p "$STATE_DIR"
+touch "$STATE_FILE" "$LOG_FILE"
+chmod 600 "$STATE_FILE" "$LOG_FILE" 2>/dev/null
+# Tighten UCI config (contains SMTP password) — defensive on every run
+[ -f /etc/config/notifip ] && chmod 600 /etc/config/notifip 2>/dev/null
+
+log_msg() { logger -t notifip "$*"; }
+
+log_change() {
+	# ts \t source \t iface \t old \t new \t notified
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "${3:--}" "$4" "$5" \
+		>> "$LOG_FILE"
+	local lines
+	lines=$(wc -l < "$LOG_FILE" 2>/dev/null)
+	if [ "${lines:-0}" -gt "$LOG_MAX_LINES" ]; then
+		tail -n "$LOG_MAX_LINES" "$LOG_FILE" > "$LOG_FILE.tmp" \
+			&& mv "$LOG_FILE.tmp" "$LOG_FILE"
+	fi
+}
+
+# --- config load ---
+ENABLED=0
+INTERVAL=5
+MODE=public
+BOOT_MAIL=1
+IFACE_LIST=""
+SOURCE_LIST=""
+SMTP_HOST=""; SMTP_PORT=587; SMTP_SEC=starttls
+SMTP_USER=""; SMTP_PASS=""; SMTP_FROM=""; SMTP_TO=""
+
+load_config() {
+	config_load notifip
+	config_get ENABLED   general enabled 0
+	config_get INTERVAL  general interval 5
+	config_get MODE      general mode public
+	config_get BOOT_MAIL general boot_mail 1
+	IFACE_LIST=""
+	config_list_foreach general iface __add_iface
+	SOURCE_LIST=""
+	config_list_foreach sources url __add_source
+	config_get SMTP_HOST smtp host ""
+	config_get SMTP_PORT smtp port 587
+	config_get SMTP_SEC  smtp security starttls
+	config_get SMTP_USER smtp user ""
+	config_get SMTP_PASS smtp password ""
+	config_get SMTP_FROM smtp from ""
+	config_get SMTP_TO   smtp to ""
+}
+__add_iface()  { IFACE_LIST="$IFACE_LIST $1"; }
+__add_source() { SOURCE_LIST="$SOURCE_LIST $1"; }
+
+# --- helpers ---
+is_valid_ipv4() {
+	echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+	local IFS=.
+	# shellcheck disable=SC2086
+	set -- $1
+	[ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+}
+
+fetch_public_ip() {
+	curl -4 -fsSL --max-time 5 "$1" 2>/dev/null \
+		| tr -d '\r\n\t ' | head -c 64
+}
+
+detect_public_ip() {
+	# echoes "ip|source_url" on success
+	# set -f: prevent glob expansion on URLs containing '*' or '?'
+	set -f
+	for u in $SOURCE_LIST; do
+		local ip
+		ip=$(fetch_public_ip "$u")
+		if is_valid_ipv4 "$ip"; then
+			set +f
+			echo "$ip|$u"
+			return 0
+		fi
+	done
+	set +f
+	return 1
+}
+
+confirm_public_ip() {
+	# args: candidate_ip used_url -> echoes confirming url or fails
+	local cand="$1" used="$2"
+	set -f
+	for u in $SOURCE_LIST; do
+		[ "$u" = "$used" ] && continue
+		local ip
+		ip=$(fetch_public_ip "$u")
+		if is_valid_ipv4 "$ip"; then
+			if [ "$ip" = "$cand" ]; then
+				set +f
+				echo "$u"
+				return 0
+			fi
+			set +f
+			return 1
+		fi
+	done
+	set +f
+	return 1
+}
+
+detect_iface_ip() {
+	ifstatus "$1" 2>/dev/null \
+		| jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null
+}
+
+# --- state ---
+state_get() {
+	awk -v k="$1" -F '\t' '$1==k{print $2; exit}' "$STATE_FILE"
+}
+state_set() {
+	local key="$1" ip="$2" tmp="$STATE_FILE.tmp"
+	local ts; ts=$(date '+%Y-%m-%dT%H:%M:%S')
+	awk -v k="$key" -v ip="$ip" -v ts="$ts" -F '\t' '
+		BEGIN { OFS="\t"; done=0 }
+		$1==k { print k, ip, ts; done=1; next }
+		{ print }
+		END { if (!done) print k, ip, ts }
+	' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+is_first_run_after_boot() { [ ! -f "$BOOT_MARKER" ]; }
+mark_booted() { touch "$BOOT_MARKER"; }
+
+# --- mail ---
+write_msmtprc() {
+	local tls starttls certcheck trust_file f
+	tls=on
+	starttls=off
+	certcheck=off
+	trust_file=""
+	case "$SMTP_SEC" in
+		smtps)    tls=on;  starttls=off ;;
+		starttls) tls=on;  starttls=on  ;;
+		none)     tls=off; starttls=off ;;
+	esac
+	# Enable cert verification only if a CA bundle is present
+	for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/ssl/certs/ca-bundle.crt; do
+		if [ -f "$f" ]; then
+			certcheck=on
+			trust_file="$f"
+			break
+		fi
+	done
+	umask 077
+	{
+		echo "defaults"
+		echo "auth           on"
+		echo "tls            $tls"
+		echo "tls_starttls   $starttls"
+		echo "tls_certcheck  $certcheck"
+		[ -n "$trust_file" ] && echo "tls_trust_file $trust_file"
+		echo "timeout        15"
+		echo "logfile        /tmp/msmtp.notifip.log"
+	} > "$MSMTPRC"
+	cat >> "$MSMTPRC" <<EOF
+
+account        notifip
+host           $SMTP_HOST
+port           $SMTP_PORT
+from           $SMTP_FROM
+user           $SMTP_USER
+password       $SMTP_PASS
+
+account default : notifip
+EOF
+	chmod 600 "$MSMTPRC"
+}
+
+send_mail() {
+	local subject="$1" body="$2"
+	[ -n "$SMTP_HOST" ] || { log_msg "SMTP host empty, skip mail"; return 1; }
+	[ -n "$SMTP_TO" ]   || { log_msg "recipient empty, skip mail";  return 1; }
+	command -v msmtp >/dev/null 2>&1 || { log_msg "msmtp not installed"; return 1; }
+
+	write_msmtprc
+	{
+		printf 'From: %s\n' "$SMTP_FROM"
+		printf 'To: %s\n' "$SMTP_TO"
+		printf 'Subject: %s\n' "$subject"
+		printf 'Date: %s\n' "$(date -R 2>/dev/null || date '+%a, %d %b %Y %H:%M:%S %z')"
+		printf 'MIME-Version: 1.0\n'
+		printf 'Content-Type: text/plain; charset=UTF-8\n'
+		printf 'Content-Transfer-Encoding: 8bit\n\n'
+		printf '%s\n' "$body"
+	} | msmtp -C "$MSMTPRC" -a notifip "$SMTP_TO" 2>>/tmp/msmtp.notifip.log
+}
+
+build_body() {
+	local iface="$1" old="$2" new="$3" source="$4" reason="$5"
+	cat <<EOF
+$reason
+
+  Router    : $HOSTNAME
+  Interface : $iface
+  Old IP    : ${old:--}
+  New IP    : $new
+  Source    : $source
+  Date      : $(date '+%Y-%m-%d %H:%M:%S')
+
+--
+NotifIP
+EOF
+}
+
+# --- main logic ---
+handle_observation() {
+	local key="$1" iface="$2" new_ip="$3" source="$4"
+	local old_ip; old_ip=$(state_get "$key")
+
+	if [ "$old_ip" = "$new_ip" ]; then
+		# No change. Boot mail?
+		if [ "$BOOT_MAIL" = "1" ] && is_first_run_after_boot; then
+			local subj="[NotifIP] $HOSTNAME started, IP=$new_ip"
+			local body; body=$(build_body "$iface" "$old_ip" "$new_ip" "$source" \
+				"NotifIP has restarted. The IP has not changed since the last shutdown.")
+			if send_mail "$subj" "$body"; then
+				log_change "$source" "$iface" "$old_ip" "$new_ip" boot
+				log_msg "boot mail sent for $iface ($new_ip)"
+			fi
+		fi
+		return
+	fi
+
+	# Change detected
+	local subj="[NotifIP] WAN IP changed: ${old_ip:--} -> $new_ip"
+	local body; body=$(build_body "$iface" "$old_ip" "$new_ip" "$source" \
+		"WAN IP change detected.")
+	if send_mail "$subj" "$body"; then
+		log_change "$source" "$iface" "$old_ip" "$new_ip" yes
+		log_msg "mail sent: $iface $old_ip -> $new_ip"
+	else
+		log_change "$source" "$iface" "$old_ip" "$new_ip" failed
+		log_msg "mail FAILED: $iface $old_ip -> $new_ip"
+	fi
+	state_set "$key" "$new_ip"
+}
+
+cmd_run() {
+	load_config
+	[ "$ENABLED" = "1" ] || exit 0
+
+	# mutex (cron + hotplug may race)
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$LOCK"
+		flock -n 9 || exit 0
+	fi
+
+	case "$MODE" in
+		public)
+			[ -n "$SOURCE_LIST" ] || { log_msg "no source URL configured"; mark_booted; exit 0; }
+			local cand ip used confirm
+			cand=$(detect_public_ip)
+			if [ -z "$cand" ]; then
+				log_msg "all sources failed"
+				mark_booted; exit 0
+			fi
+			ip=${cand%%|*}
+			used=${cand##*|}
+			old=$(state_get public)
+			if [ "$old" != "$ip" ] && [ -n "$old" ]; then
+				# Confirm change with another source
+				confirm=$(confirm_public_ip "$ip" "$used")
+				if [ -z "$confirm" ]; then
+					log_msg "candidate $ip not confirmed, ignored"
+					mark_booted; exit 0
+				fi
+				handle_observation public public "$ip" "$used,$confirm"
+			else
+				handle_observation public public "$ip" "$used"
+			fi
+			;;
+		iface)
+			[ -n "$IFACE_LIST" ] || { log_msg "no iface configured"; mark_booted; exit 0; }
+			set -f
+			for iface in $IFACE_LIST; do
+				ip=$(detect_iface_ip "$iface")
+				if [ -z "$ip" ]; then
+					log_msg "$iface has no IPv4"
+					continue
+				fi
+				handle_observation "iface:$iface" "$iface" "$ip" "ubus"
+			done
+			set +f
+			;;
+		*)
+			log_msg "unknown mode: $MODE"
+			;;
+	esac
+
+	mark_booted
+}
+
+cmd_test_mail() {
+	load_config
+	local subj="[NotifIP] Test mail"
+	local body
+	body=$(cat <<EOF
+This is a test mail sent by NotifIP on $HOSTNAME.
+
+If you received this message, your SMTP configuration is working.
+
+Date: $(date '+%Y-%m-%d %H:%M:%S')
+
+--
+NotifIP
+EOF
+)
+	if send_mail "$subj" "$body"; then
+		echo "OK"
+		return 0
+	fi
+	echo "FAIL (see /tmp/msmtp.notifip.log)"
+	return 1
+}
+
+cmd_status() {
+	load_config
+	printf '{'
+	printf '"enabled":%s,' "$ENABLED"
+	printf '"mode":"%s",' "$MODE"
+	printf '"interval":%s,' "$INTERVAL"
+	printf '"state":['
+	local first=1 row key ip ts
+	while IFS=$(printf '\t') read -r key ip ts; do
+		[ -n "$key" ] || continue
+		[ $first -eq 1 ] || printf ','
+		first=0
+		printf '{"key":"%s","ip":"%s","since":"%s"}' "$key" "$ip" "$ts"
+	done < "$STATE_FILE"
+	printf ']}'
+}
+
+cmd_log() {
+	# Print log as JSON array
+	printf '['
+	local first=1 ts source iface old new notif
+	while IFS=$(printf '\t') read -r ts source iface old new notif; do
+		[ -n "$ts" ] || continue
+		[ $first -eq 1 ] || printf ','
+		first=0
+		printf '{"ts":"%s","source":"%s","iface":"%s","old":"%s","new":"%s","notified":"%s"}' \
+			"$ts" "$source" "$iface" "$old" "$new" "$notif"
+	done < "$LOG_FILE"
+	printf ']'
+}
+
+case "${1:-run}" in
+	run)       cmd_run ;;
+	test-mail) cmd_test_mail ;;
+	status)    cmd_status ;;
+	log)       cmd_log ;;
+	clear-log) : > "$LOG_FILE"; echo OK ;;
+	*) echo "usage: $0 {run|test-mail|status|log|clear-log}" >&2; exit 2 ;;
+esac

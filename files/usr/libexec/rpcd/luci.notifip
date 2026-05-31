@@ -1,0 +1,50 @@
+#!/bin/sh
+# rpcd plugin: exposes luci.notifip.{status,log,test_mail,clear_log}
+
+. /usr/share/libubox/jshn.sh
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "status";    json_close_object
+		json_add_object "log";       json_close_object
+		json_add_object "test_mail"; json_close_object
+		json_add_object "clear_log"; json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			status)
+				/usr/bin/notifip status
+				;;
+			log)
+				/usr/bin/notifip log
+				;;
+			test_mail)
+				out=$(/usr/bin/notifip test-mail 2>&1)
+				rc=$?
+				json_init
+				json_add_int    "code" "$rc"
+				json_add_string "result" "$out"
+				if [ -f /tmp/msmtp.notifip.log ]; then
+					json_add_string "log" "$(tail -n 50 /tmp/msmtp.notifip.log)"
+				else
+					json_add_string "log" ""
+				fi
+				json_dump
+				;;
+			clear_log)
+				/usr/bin/notifip clear-log >/dev/null
+				json_init
+				json_add_string "result" "OK"
+				json_dump
+				;;
+			*)
+				json_init
+				json_add_string "error" "unknown method"
+				json_dump
+				exit 1
+				;;
+		esac
+		;;
+esac

@@ -1,0 +1,29 @@
+{
+	"admin/services/notifip": {
+		"title": "NotifIP",
+		"order": 60,
+		"action": {
+			"type": "firstchild",
+			"recurse": true
+		},
+		"depends": {
+			"acl": [ "luci-app-notifip" ],
+			"uci": { "notifip": true }
+		}
+	},
+	"admin/services/notifip/settings": {
+		"title": "Settings",
+		"order": 10,
+		"action": { "type": "view", "path": "notifip/settings" }
+	},
+	"admin/services/notifip/sources": {
+		"title": "Sources",
+		"order": 20,
+		"action": { "type": "view", "path": "notifip/sources" }
+	},
+	"admin/services/notifip/history": {
+		"title": "History",
+		"order": 30,
+		"action": { "type": "view", "path": "notifip/history" }
+	}
+}

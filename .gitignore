@@ -1,0 +1,18 @@
+# Generated self-extracting installer (rebuild with ./build-onrouter.sh)
+install-on-router.sh
+
+# macOS noise
+.DS_Store
+._*
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artefacts
+*.ipk
+/build/
+/bin/
+/dist/

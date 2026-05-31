@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# NotifIP — manual installer (no OpenWRT SDK required)
+#
+# Usage:
+#   ./install.sh root@192.168.1.1            # default ssh port 22
+#   ./install.sh root@192.168.1.1 -p 2222    # custom ssh port
+#
+# What it does:
+#   1. Copies files/* to / on the router via tar over ssh
+#   2. chmod +x on the executables
+#   3. Installs missing dependencies (msmtp, curl, jsonfilter, cron) via opkg
+#   4. Reloads rpcd and starts the notifip service
+#
+# Assumes you can ssh as root to the router (key auth or you will be
+# prompted for the password a few times).
+
+set -eo pipefail
+
+if [ $# -lt 1 ]; then
+	echo "Usage: $0 <user@host> [-p ssh_port]" >&2
+	exit 1
+fi
+
+TARGET="$1"; shift
+SSH_PORT=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-p) SSH_PORT="$2"; shift 2 ;;
+		*) echo "Unknown option: $1" >&2; exit 1 ;;
+	esac
+done
+
+ssh_cmd() {
+	if [ -n "$SSH_PORT" ]; then
+		ssh -p "$SSH_PORT" "$@"
+	else
+		ssh "$@"
+	fi
+}
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+FILES_DIR="$HERE/files"
+
+if [ ! -d "$FILES_DIR" ]; then
+	echo "files/ directory not found at $FILES_DIR" >&2
+	exit 1
+fi
+
+echo "==> Copying files to $TARGET …"
+# tar | ssh is more reliable than scp -r for preserving paths and modes
+(cd "$FILES_DIR" && tar -cf - .) \
+	| ssh_cmd "$TARGET" 'tar -xf - -C /'
+
+echo "==> Setting ownership, executable bits, tightening config …"
+ssh_cmd "$TARGET" '
+	# tar preserved local UID/GID from the Mac — force root ownership on every NotifIP file
+	chown -R 0:0 /usr/bin/notifip \
+	             /etc/init.d/notifip \
+	             /etc/hotplug.d/iface/30-notifip \
+	             /usr/libexec/rpcd/luci.notifip \
+	             /usr/share/luci/menu.d/luci-app-notifip.json \
+	             /usr/share/rpcd/acl.d/luci-app-notifip.json \
+	             /www/luci-static/resources/view/notifip \
+	             /etc/config/notifip 2>/dev/null || true
+	chmod 0755 /usr/bin/notifip \
+	           /etc/init.d/notifip \
+	           /etc/hotplug.d/iface/30-notifip \
+	           /usr/libexec/rpcd/luci.notifip
+	# Config holds the SMTP password — restrict to root
+	chmod 0600 /etc/config/notifip 2>/dev/null || true
+'
+
+echo "==> Installing missing dependencies …"
+ssh_cmd "$TARGET" '
+	NEED=""
+	command -v msmtp      >/dev/null 2>&1 || NEED="$NEED msmtp"
+	command -v curl       >/dev/null 2>&1 || NEED="$NEED curl"
+	command -v jsonfilter >/dev/null 2>&1 || NEED="$NEED jsonfilter"
+	command -v crond      >/dev/null 2>&1 || NEED="$NEED cron"
+	# ca-bundle enables real TLS certificate verification for SMTP
+	if [ ! -f /etc/ssl/certs/ca-certificates.crt ] \
+	&& [ ! -f /etc/ssl/cert.pem ] \
+	&& [ ! -f /etc/ssl/certs/ca-bundle.crt ]; then
+		NEED="$NEED ca-bundle"
+	fi
+	if [ -n "$NEED" ]; then
+		echo "  Need: $NEED"
+		opkg update
+		# shellcheck disable=SC2086
+		opkg install $NEED
+	else
+		echo "  All dependencies already present."
+	fi
+'
+
+echo "==> Reloading rpcd and enabling notifip …"
+ssh_cmd "$TARGET" '
+	/etc/init.d/rpcd reload    2>/dev/null || true
+	/etc/init.d/cron enable    2>/dev/null || true
+	/etc/init.d/cron start     2>/dev/null || true
+	/etc/init.d/notifip enable 2>/dev/null || true
+	/etc/init.d/notifip start  2>/dev/null || true
+'
+
+cat <<EOF
+
+==> Installation done.
+
+Open LuCI: http://<router>/  → Services → NotifIP
+Configure SMTP, pick the mode, enable, Save & Apply, then "Send test mail".
+
+Useful logs on the router:
+  logread -e notifip
+  cat /etc/notifip/changes.log
+  cat /tmp/msmtp.notifip.log     # last msmtp run
+EOF
