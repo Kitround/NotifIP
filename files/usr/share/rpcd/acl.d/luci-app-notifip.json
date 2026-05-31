@@ -4,7 +4,7 @@
 		"read": {
 			"uci": [ "notifip" ],
 			"ubus": {
-				"luci.notifip": [ "status", "log", "test_mail", "clear_log" ]
+				"luci.notifip": [ "status", "log" ]
 			},
 			"file": {
 				"/etc/notifip/changes.log": [ "read" ],

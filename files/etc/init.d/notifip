@@ -61,6 +61,8 @@ start_service() {
 
 stop_service() {
 	remove_cron
+	# Remove generated SMTP credentials file (recreated on next send)
+	rm -f /etc/msmtprc.notifip
 }
 
 reload_service() {

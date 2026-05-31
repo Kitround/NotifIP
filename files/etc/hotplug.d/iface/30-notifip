@@ -1,10 +1,11 @@
 #!/bin/sh
-# Trigger NotifIP on WAN-ish ifup events
+# Trigger NotifIP on WAN-ish ifup events.
+# Catches wan, wan6, wan2, wwan, wwan0, wan_4, wan_v6, mwan*…
 
 [ "$ACTION" = "ifup" ] || exit 0
 
 case "$INTERFACE" in
-	wan|wan6|wwan|wan_*)
+	wan*|wwan*|mwan*)
 		(sleep 5; /usr/bin/notifip run) >/dev/null 2>&1 &
 		;;
 esac

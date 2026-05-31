@@ -31,6 +31,13 @@ chmod 600 "$STATE_FILE" "$LOG_FILE" 2>/dev/null
 
 log_msg() { logger -t notifip "$*"; }
 
+# JSON-escape a string argument: handles backslash, quote, tab, CR, LF.
+json_escape() {
+	# Order matters: escape backslash FIRST, then the rest.
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
+		| tr '\r\n' ' ' | tr -d '\000-\010\013-\037'
+}
+
 log_change() {
 	# ts \t source \t iface \t old \t new \t notified
 	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -301,6 +308,8 @@ cmd_run() {
 			;;
 		iface)
 			[ -n "$IFACE_LIST" ] || { log_msg "no iface configured"; mark_booted; exit 0; }
+			# trap restores globbing even on error/signal
+			trap 'set +f' EXIT INT TERM
 			set -f
 			for iface in $IFACE_LIST; do
 				ip=$(detect_iface_ip "$iface")
@@ -311,6 +320,7 @@ cmd_run() {
 				handle_observation "iface:$iface" "$iface" "$ip" "ubus"
 			done
 			set +f
+			trap - EXIT INT TERM
 			;;
 		*)
 			log_msg "unknown mode: $MODE"
@@ -322,6 +332,11 @@ cmd_run() {
 
 cmd_test_mail() {
 	load_config
+	# Serialize against cron/hotplug runs (both touch /etc/msmtprc.notifip)
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$LOCK"
+		flock -w 10 9 || { echo "BUSY (another notifip run in progress)"; return 1; }
+	fi
 	local subj="[NotifIP] Test mail"
 	local body
 	body=$(cat <<EOF
@@ -345,31 +360,38 @@ EOF
 
 cmd_status() {
 	load_config
+	# ENABLED / INTERVAL are coerced to 0/1 or integers in the load step;
+	# validate numerically and emit safe integers in JSON.
+	local en="${ENABLED:-0}" iv="${INTERVAL:-5}"
+	case "$en" in 0|1) ;; *) en=0 ;; esac
+	case "$iv" in *[!0-9]*|"") iv=5 ;; esac
 	printf '{'
-	printf '"enabled":%s,' "$ENABLED"
-	printf '"mode":"%s",' "$MODE"
-	printf '"interval":%s,' "$INTERVAL"
+	printf '"enabled":%s,'  "$en"
+	printf '"mode":"%s",'   "$(json_escape "$MODE")"
+	printf '"interval":%s,' "$iv"
 	printf '"state":['
-	local first=1 row key ip ts
-	while IFS=$(printf '\t') read -r key ip ts; do
+	local first=1 key ip ts
+	while IFS='	' read -r key ip ts; do
 		[ -n "$key" ] || continue
 		[ $first -eq 1 ] || printf ','
 		first=0
-		printf '{"key":"%s","ip":"%s","since":"%s"}' "$key" "$ip" "$ts"
+		printf '{"key":"%s","ip":"%s","since":"%s"}' \
+			"$(json_escape "$key")" "$(json_escape "$ip")" "$(json_escape "$ts")"
 	done < "$STATE_FILE"
 	printf ']}'
 }
 
 cmd_log() {
-	# Print log as JSON array
 	printf '['
 	local first=1 ts source iface old new notif
-	while IFS=$(printf '\t') read -r ts source iface old new notif; do
+	while IFS='	' read -r ts source iface old new notif; do
 		[ -n "$ts" ] || continue
 		[ $first -eq 1 ] || printf ','
 		first=0
 		printf '{"ts":"%s","source":"%s","iface":"%s","old":"%s","new":"%s","notified":"%s"}' \
-			"$ts" "$source" "$iface" "$old" "$new" "$notif"
+			"$(json_escape "$ts")"     "$(json_escape "$source")" \
+			"$(json_escape "$iface")"  "$(json_escape "$old")"    \
+			"$(json_escape "$new")"    "$(json_escape "$notif")"
 	done < "$LOG_FILE"
 	printf ']'
 }
