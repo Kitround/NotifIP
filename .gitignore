@@ -17,3 +17,4 @@ install-on-router.sh
 /bin/
 /dist/
 CLAUDE.md
+.claude/
