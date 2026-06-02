@@ -158,6 +158,15 @@ state_set() {
 is_first_run_after_boot() { [ ! -f "$BOOT_MARKER" ]; }
 mark_booted() { touch "$BOOT_MARKER"; }
 
+# Keep only state rows whose first column matches one of the given keys.
+prune_state() {
+	local wanted="$1" tmp="$STATE_FILE.tmp"
+	awk -v wanted="$wanted" -F '\t' '
+		BEGIN { n=split(wanted, arr, " "); for (i=1;i<=n;i++) if (arr[i]!="") keep[arr[i]]=1 }
+		$1 in keep { print }
+	' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
 # --- mail ---
 write_msmtprc() {
 	local tls starttls certcheck trust_file f
@@ -200,7 +209,7 @@ password       $SMTP_PASS
 
 account default : notifip
 EOF
-	chmod 600 "$MSMTPRC"
+	# File created under umask 077 -> already 0600; no extra chmod needed.
 }
 
 send_mail() {
@@ -244,8 +253,27 @@ handle_observation() {
 	local key="$1" iface="$2" new_ip="$3" source="$4"
 	local old_ip; old_ip=$(state_get "$key")
 
+	# First observation ever for this key (fresh install, mode change, etc.) —
+	# do NOT send a fake "change" mail. Init state silently, or send a boot mail
+	# if BOOT_MAIL=1 and this is the first run after a reboot.
+	if [ -z "$old_ip" ]; then
+		if [ "$BOOT_MAIL" = "1" ] && is_first_run_after_boot; then
+			local subj="[NotifIP] $HOSTNAME started, IP=$new_ip"
+			local body; body=$(build_body "$iface" "" "$new_ip" "$source" \
+				"NotifIP started. First observed IP for this interface.")
+			if send_mail "$subj" "$body"; then
+				log_change "$source" "$iface" "" "$new_ip" boot
+				log_msg "boot mail sent for $iface ($new_ip)"
+			fi
+		else
+			log_msg "init state for $iface=$new_ip (no mail)"
+		fi
+		state_set "$key" "$new_ip"
+		return
+	fi
+
 	if [ "$old_ip" = "$new_ip" ]; then
-		# No change. Boot mail?
+		# Same IP. Boot mail?
 		if [ "$BOOT_MAIL" = "1" ] && is_first_run_after_boot; then
 			local subj="[NotifIP] $HOSTNAME started, IP=$new_ip"
 			local body; body=$(build_body "$iface" "$old_ip" "$new_ip" "$source" \
@@ -258,8 +286,8 @@ handle_observation() {
 		return
 	fi
 
-	# Change detected
-	local subj="[NotifIP] WAN IP changed: ${old_ip:--} -> $new_ip"
+	# Real change detected
+	local subj="[NotifIP] WAN IP changed: $old_ip -> $new_ip"
 	local body; body=$(build_body "$iface" "$old_ip" "$new_ip" "$source" \
 		"WAN IP change detected.")
 	if send_mail "$subj" "$body"; then
@@ -281,6 +309,15 @@ cmd_run() {
 		exec 9>"$LOCK"
 		flock -n 9 || exit 0
 	fi
+
+	# Compute the set of state keys we'll observe and prune anything else.
+	# This drops stale rows when the user switches mode or interface list.
+	local wanted_keys=""
+	case "$MODE" in
+		public) wanted_keys="public" ;;
+		iface)  for i in $IFACE_LIST; do wanted_keys="$wanted_keys iface:$i"; done ;;
+	esac
+	prune_state "$wanted_keys"
 
 	case "$MODE" in
 		public)
@@ -402,11 +439,60 @@ cmd_log() {
 	printf ']'
 }
 
+cmd_check_now() {
+	# Force a check regardless of the "enabled" flag — useful from the LuCI button.
+	load_config
+	ENABLED=1
+	# Re-enter the run pipeline but skip the load_config inside cmd_run by inlining.
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$LOCK"
+		flock -n 9 || { echo "BUSY"; return 1; }
+	fi
+	local wanted_keys=""
+	case "$MODE" in
+		public) wanted_keys="public" ;;
+		iface)  for i in $IFACE_LIST; do wanted_keys="$wanted_keys iface:$i"; done ;;
+	esac
+	prune_state "$wanted_keys"
+	case "$MODE" in
+		public)
+			[ -n "$SOURCE_LIST" ] || { echo "no source URL configured"; return 1; }
+			local cand ip used confirm old
+			cand=$(detect_public_ip)
+			[ -n "$cand" ] || { echo "all sources failed"; return 1; }
+			ip=${cand%%|*}; used=${cand##*|}
+			old=$(state_get public)
+			if [ "$old" != "$ip" ] && [ -n "$old" ]; then
+				confirm=$(confirm_public_ip "$ip" "$used")
+				[ -n "$confirm" ] || { echo "candidate $ip not confirmed"; return 1; }
+				handle_observation public public "$ip" "$used,$confirm"
+			else
+				handle_observation public public "$ip" "$used"
+			fi
+			;;
+		iface)
+			[ -n "$IFACE_LIST" ] || { echo "no iface configured"; return 1; }
+			trap 'set +f' EXIT INT TERM
+			set -f
+			for iface in $IFACE_LIST; do
+				ip=$(detect_iface_ip "$iface")
+				[ -n "$ip" ] || { echo "$iface has no IPv4"; continue; }
+				handle_observation "iface:$iface" "$iface" "$ip" "ubus"
+			done
+			set +f
+			trap - EXIT INT TERM
+			;;
+	esac
+	mark_booted
+	echo "OK"
+}
+
 case "${1:-run}" in
 	run)       cmd_run ;;
+	check-now) cmd_check_now ;;
 	test-mail) cmd_test_mail ;;
 	status)    cmd_status ;;
 	log)       cmd_log ;;
 	clear-log) : > "$LOG_FILE"; echo OK ;;
-	*) echo "usage: $0 {run|test-mail|status|log|clear-log}" >&2; exit 2 ;;
+	*) echo "usage: $0 {run|check-now|test-mail|status|log|clear-log}" >&2; exit 2 ;;
 esac

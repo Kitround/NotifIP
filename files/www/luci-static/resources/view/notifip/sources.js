@@ -21,8 +21,13 @@ return view.extend({
 
 		const o = s.option(form.DynamicList, 'url', _('URLs'));
 		o.placeholder = 'https://api.ipify.org';
-		o.datatype = 'string';
 		o.rmempty = false;
+		o.validate = function (_section, value) {
+			if (!value) return true;
+			return /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(value)
+				? true
+				: _('Must be an http(s) URL');
+		};
 
 		return m.render();
 	}

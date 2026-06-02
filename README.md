@@ -1,6 +1,6 @@
 # NotifIP
 
-LuCI plugin for OpenWRT that sends an email (SMTP) when the WAN IP changes.
+LuCI plugin for OpenWrt that sends an email (SMTP) when the WAN IP changes.
 
 - Choice between **public IP** (external HTTP services with fallback + double-check) or **local interface IP(s)**.
 - Triggered by cron (configurable interval, default 5 min) **and** by hotplug `ifup` on WAN.
@@ -9,28 +9,16 @@ LuCI plugin for OpenWRT that sends an email (SMTP) when the WAN IP changes.
 - History viewable from LuCI.
 - SMTP password stored in `/etc/config/notifip` (root-readable only).
 
+## Requirements
+
+- **OpenWrt 22.03 or newer** (uses client-side JS LuCI views and `network.getNetworks()`).
+- `msmtp`, `curl`, `jsonfilter`, `cron` (installed automatically by the installers below).
+
 ## Install
 
-### Option A — `install.sh` script (recommended, no SDK)
+### Recommended — `.ipk` from GitHub Releases
 
-From this folder:
-
-```sh
-./install.sh root@192.168.1.1
-# or with a custom ssh port:
-./install.sh root@192.168.1.1 -p 2222
-```
-
-The script:
-
-1. copies the `files/` tree to `/` on the router,
-2. sets executable bits,
-3. installs `msmtp`, `curl`, `jsonfilter`, `cron` via `opkg` if missing,
-4. reloads `rpcd` and enables the service.
-
-### Option B — `.ipk` from GitHub Releases (recommended for updates)
-
-The CI publishes a noarch `.ipk` on every tag. From the router:
+CI publishes a noarch `.ipk` on every tag. From the router:
 
 ```sh
 URL=https://github.com/Kitround/NotifIP/releases/latest/download/luci-app-notifip_all.ipk
@@ -43,9 +31,21 @@ opkg install /tmp/notifip.ipk
 rm /tmp/notifip.ipk
 ```
 
-Future updates: same commands. `/etc/config/notifip` is declared as a conffile, so opkg preserves your SMTP and source settings across upgrades.
+Future updates use the exact same command. `/etc/config/notifip` is declared as a conffile, so opkg preserves your SMTP and source settings across upgrades.
 
-### Option C — Build `.ipk` yourself via the OpenWrt SDK
+### Alternative — `install.sh` script (dev/test, no SDK)
+
+From a clone of this repo on your workstation:
+
+```sh
+./install.sh root@192.168.1.1
+# or with a custom ssh port:
+./install.sh root@192.168.1.1 -p 2222
+```
+
+The script copies `files/*` to `/` on the router, installs missing dependencies via `opkg`, and enables the service. Useful when iterating on code, but it **overwrites** `/etc/config/notifip` — back up your SMTP settings first.
+
+### Alternative — Build `.ipk` yourself via the OpenWrt SDK
 
 ```sh
 cp -r NotifIP <openwrt-sdk>/package/luci-app-notifip

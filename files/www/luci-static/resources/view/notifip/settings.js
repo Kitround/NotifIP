@@ -12,6 +12,17 @@ const callTestMail = rpc.declare({
 	expect: { '': {} }
 });
 
+const callCheckNow = rpc.declare({
+	object: 'luci.notifip',
+	method: 'check_now',
+	expect: { '': {} }
+});
+
+function emailValidator(_section, value) {
+	if (!value) return true;
+	return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? true : _('Invalid email address');
+}
+
 return view.extend({
 	load: function () {
 		return Promise.all([
@@ -87,9 +98,33 @@ return view.extend({
 
 		o = s.option(form.Value, 'from', _('From'));
 		o.placeholder = 'router@example.com';
+		o.validate = emailValidator;
 
 		o = s.option(form.Value, 'to', _('To'));
 		o.placeholder = 'you@example.com';
+		o.validate = emailValidator;
+
+		o = s.option(form.Button, '_checknow', _('Check now'),
+			_('Run an immediate IP check using the saved configuration. Useful to populate the History without waiting for the next cron tick.'));
+		o.inputtitle = _('Check now');
+		o.onclick = function () {
+			ui.showModal(_('Checking…'), [
+				E('p', { 'class': 'spinning' }, _('Running notifip check-now…'))
+			]);
+			return callCheckNow().then(function (res) {
+				ui.hideModal();
+				const ok = (res && res.code === 0);
+				ui.showModal(ok ? _('Done') : _('Check failed'), [
+					E('p', {}, (res && res.result) || _('(no output)')),
+					E('div', { 'class': 'right' }, [
+						E('button', { 'class': 'btn cbi-button', 'click': ui.hideModal }, _('Close'))
+					])
+				]);
+			}).catch(function (err) {
+				ui.hideModal();
+				ui.addNotification(null, E('p', {}, _('RPC error: ') + err), 'danger');
+			});
+		};
 
 		o = s.option(form.Button, '_test', _('Send test mail'),
 			_('Immediately sends a test mail using the SAVED configuration. Save & Apply first.'));

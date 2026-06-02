@@ -15,7 +15,7 @@
 		"write": {
 			"uci": [ "notifip" ],
 			"ubus": {
-				"luci.notifip": [ "test_mail", "clear_log" ]
+				"luci.notifip": [ "test_mail", "clear_log", "check_now" ]
 			}
 		}
 	}
