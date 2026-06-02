@@ -11,7 +11,7 @@ LuCI plugin for OpenWrt that sends an email (SMTP) when the WAN IP changes.
 
 ## Requirements
 
-- **OpenWrt 21.02 or newer** (uses client-side JS LuCI views).
+- **OpenWrt 19.07 or newer** (uses client-side JS LuCI views).
 - `msmtp`, `curl`, `jsonfilter`, `cron` (installed automatically by the installers below).
 
 ## Install
