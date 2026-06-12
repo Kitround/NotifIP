@@ -24,6 +24,9 @@ HOSTNAME=$(uci -q get system.@system[0].hostname 2>/dev/null)
 HOSTNAME=$(printf '%s' "$HOSTNAME" | tr -d '\r\n')
 
 mkdir -p "$STATE_DIR"
+# /var/lock may not exist on minimal builds; a failed `exec 9>` redirection
+# would silently kill the whole script, so make sure the dir is there.
+mkdir -p /var/lock 2>/dev/null
 touch "$STATE_FILE" "$LOG_FILE"
 chmod 600 "$STATE_FILE" "$LOG_FILE" 2>/dev/null
 # Tighten UCI config (contains SMTP password) — defensive on every run
@@ -34,7 +37,9 @@ log_msg() { logger -t notifip "$*"; }
 # JSON-escape a string argument: handles backslash, quote, tab, CR, LF.
 json_escape() {
 	# Order matters: escape backslash FIRST, then the rest.
-	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
+	# TAB via printf so the script survives editors that mangle literal tabs.
+	local tab; tab=$(printf '\t')
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$tab/\\\\t/g" \
 		| tr '\r\n' ' ' | tr -d '\000-\010\013-\037'
 }
 
@@ -170,6 +175,15 @@ prune_state() {
 # --- mail ---
 write_msmtprc() {
 	local tls starttls certcheck trust_file f
+	# Keep the msmtp log bounded (~50 KB): it lives in tmpfs (RAM) and grows
+	# on every send; a flapping line + long uptime would slowly eat memory.
+	local mlog=/tmp/msmtp.notifip.log msize
+	if [ -f "$mlog" ]; then
+		msize=$(wc -c < "$mlog" 2>/dev/null)
+		if [ "${msize:-0}" -gt 51200 ]; then
+			tail -c 20480 "$mlog" > "$mlog.tmp" && mv "$mlog.tmp" "$mlog"
+		fi
+	fi
 	tls=on
 	starttls=off
 	certcheck=off
@@ -300,18 +314,20 @@ handle_observation() {
 	state_set "$key" "$new_ip"
 }
 
-cmd_run() {
-	load_config
-	[ "$ENABLED" = "1" ] || exit 0
+# Acquire the run mutex non-blocking. Returns 1 if another run holds it.
+take_lock() {
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 9>"$LOCK"
+	flock -n 9
+}
 
-	# mutex (cron + hotplug may race)
-	if command -v flock >/dev/null 2>&1; then
-		exec 9>"$LOCK"
-		flock -n 9 || exit 0
-	fi
-
-	# Compute the set of state keys we'll observe and prune anything else.
-	# This drops stale rows when the user switches mode or interface list.
+# One detection cycle for the configured MODE. Shared by cmd_run (cron/hotplug)
+# and cmd_check_now (LuCI button). Returns 0 on success, 1 on failure with the
+# reason in $CHECK_ERR. Per-interface "no IPv4" is logged but not fatal.
+CHECK_ERR=""
+do_checks() {
+	CHECK_ERR=""
+	# Prune state rows that no longer match the configured mode/iface list.
 	local wanted_keys=""
 	case "$MODE" in
 		public) wanted_keys="public" ;;
@@ -321,30 +337,24 @@ cmd_run() {
 
 	case "$MODE" in
 		public)
-			[ -n "$SOURCE_LIST" ] || { log_msg "no source URL configured"; mark_booted; exit 0; }
-			local cand ip used confirm
+			[ -n "$SOURCE_LIST" ] || { CHECK_ERR="no source URL configured"; return 1; }
+			local cand ip used confirm old
 			cand=$(detect_public_ip)
-			if [ -z "$cand" ]; then
-				log_msg "all sources failed"
-				mark_booted; exit 0
-			fi
+			[ -n "$cand" ] || { CHECK_ERR="all sources failed"; return 1; }
 			ip=${cand%%|*}
 			used=${cand##*|}
 			old=$(state_get public)
 			if [ "$old" != "$ip" ] && [ -n "$old" ]; then
-				# Confirm change with another source
+				# Confirm change with another source before alerting
 				confirm=$(confirm_public_ip "$ip" "$used")
-				if [ -z "$confirm" ]; then
-					log_msg "candidate $ip not confirmed, ignored"
-					mark_booted; exit 0
-				fi
+				[ -n "$confirm" ] || { CHECK_ERR="candidate $ip not confirmed, ignored"; return 1; }
 				handle_observation public public "$ip" "$used,$confirm"
 			else
 				handle_observation public public "$ip" "$used"
 			fi
 			;;
 		iface)
-			[ -n "$IFACE_LIST" ] || { log_msg "no iface configured"; mark_booted; exit 0; }
+			[ -n "$IFACE_LIST" ] || { CHECK_ERR="no iface configured"; return 1; }
 			# trap restores globbing even on error/signal
 			trap 'set +f' EXIT INT TERM
 			set -f
@@ -360,10 +370,21 @@ cmd_run() {
 			trap - EXIT INT TERM
 			;;
 		*)
-			log_msg "unknown mode: $MODE"
+			CHECK_ERR="unknown mode: $MODE"
+			return 1
 			;;
 	esac
+	return 0
+}
 
+cmd_run() {
+	load_config
+	# Mark the boot even when disabled, so enabling later doesn't trigger a
+	# misleading "router started" mail long after the actual reboot.
+	[ "$ENABLED" = "1" ] || { mark_booted; exit 0; }
+
+	take_lock || exit 0
+	do_checks || log_msg "$CHECK_ERR"
 	mark_booted
 }
 
@@ -425,7 +446,9 @@ cmd_status() {
 }
 
 cmd_log() {
-	printf '['
+	# ubus/rpcd expects an object at the top level, not a bare array — wrap the
+	# entries so rpcd transports it as a valid blobmsg table.
+	printf '{"entries":['
 	local first=1 ts source iface old new notif
 	while IFS='	' read -r ts source iface old new notif; do
 		[ -n "$ts" ] || continue
@@ -436,55 +459,24 @@ cmd_log() {
 			"$(json_escape "$iface")"  "$(json_escape "$old")"    \
 			"$(json_escape "$new")"    "$(json_escape "$notif")"
 	done < "$LOG_FILE"
-	printf ']'
+	printf ']}'
 }
 
 cmd_check_now() {
-	# Force a check regardless of the "enabled" flag — useful from the LuCI button.
+	# Force a check regardless of the "enabled" flag — used by the LuCI button.
 	load_config
-	ENABLED=1
-	# Re-enter the run pipeline but skip the load_config inside cmd_run by inlining.
-	if command -v flock >/dev/null 2>&1; then
-		exec 9>"$LOCK"
-		flock -n 9 || { echo "BUSY"; return 1; }
+	if ! take_lock; then
+		echo "BUSY (another notifip run in progress)"
+		return 1
 	fi
-	local wanted_keys=""
-	case "$MODE" in
-		public) wanted_keys="public" ;;
-		iface)  for i in $IFACE_LIST; do wanted_keys="$wanted_keys iface:$i"; done ;;
-	esac
-	prune_state "$wanted_keys"
-	case "$MODE" in
-		public)
-			[ -n "$SOURCE_LIST" ] || { echo "no source URL configured"; return 1; }
-			local cand ip used confirm old
-			cand=$(detect_public_ip)
-			[ -n "$cand" ] || { echo "all sources failed"; return 1; }
-			ip=${cand%%|*}; used=${cand##*|}
-			old=$(state_get public)
-			if [ "$old" != "$ip" ] && [ -n "$old" ]; then
-				confirm=$(confirm_public_ip "$ip" "$used")
-				[ -n "$confirm" ] || { echo "candidate $ip not confirmed"; return 1; }
-				handle_observation public public "$ip" "$used,$confirm"
-			else
-				handle_observation public public "$ip" "$used"
-			fi
-			;;
-		iface)
-			[ -n "$IFACE_LIST" ] || { echo "no iface configured"; return 1; }
-			trap 'set +f' EXIT INT TERM
-			set -f
-			for iface in $IFACE_LIST; do
-				ip=$(detect_iface_ip "$iface")
-				[ -n "$ip" ] || { echo "$iface has no IPv4"; continue; }
-				handle_observation "iface:$iface" "$iface" "$ip" "ubus"
-			done
-			set +f
-			trap - EXIT INT TERM
-			;;
-	esac
+	if do_checks; then
+		mark_booted
+		echo "OK"
+		return 0
+	fi
 	mark_booted
-	echo "OK"
+	echo "${CHECK_ERR:-check failed}"
+	return 1
 }
 
 case "${1:-run}" in

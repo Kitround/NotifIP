@@ -13,7 +13,7 @@ const callStatus = rpc.declare({
 const callLog = rpc.declare({
 	object: 'luci.notifip',
 	method: 'log',
-	expect: { '': [] }
+	expect: { 'entries': [] }
 });
 
 const callClear = rpc.declare({
